@@ -8,20 +8,18 @@ on:
 env:
   FF_PKG: com.dts.freefireth
 
-  # ============== চিট লিস্ট ==============
-  # ফরম্যাট:   method_name|hex      (offset নিজে খুঁজে নেবে)
+  # ============== চিট লিস্ট (এখানে চিট যোগ/বিয়োগ করবে) ==============
+  # ফরম্যাট:   method_name|hex
   #       বা:  0xOFFSET|hex
-  # arm64:  return 0 -> 000080D2C0035FD6
-  #         return 1 -> 200080D2C0035FD6
+  #
+  # arm64 hex রেসিপি:
+  #   return 0  -> 000080D2C0035FD6
+  #   return 1  -> 200080D2C0035FD6
+  #   return 0x13 (19) -> 730080D2C0035FD6
   TARGETS: |
     get_isAlive|200080D2C0035FD6
     get_isVisible|200080D2C0035FD6
     IsFiring|200080D2C0035FD6
-    get_AttackableEntity_IsVisible|200080D2C0035FD6
-    get_AttackableEntity_GetIsDead|000080D2C0035FD6
-    get_IsSighting|000080D2C0035FD6
-    get_IsCrouching|000080D2C0035FD6
-    get_isLocalTeam|000080D2C0035FD6
 
 jobs:
   build:
@@ -73,42 +71,54 @@ jobs:
 
       - name: Get Il2CppDumper-Free-Fire
         run: |
+          set -e
           mkdir -p dumper
           DL=$(curl -s https://api.github.com/repos/tien0246/Il2CppDumper-Free-Fire/releases/latest \
                | grep -o '"browser_download_url": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
           if [ -n "$DL" ]; then
+            echo "release: $DL"
             curl -L -o d.zip "$DL" && unzip -o d.zip -d dumper > /dev/null || true
           fi
           if ! find dumper -iname "Il2CppDumper*" -type f | grep -q .; then
+            echo "building from source..."
             git clone --depth 1 https://github.com/tien0246/Il2CppDumper-Free-Fire.git src
             CSP=$(find src -name "*.csproj" | head -1)
             dotnet publish "$CSP" -c Release -o dumper/build
           fi
+          echo "--- dumper files ---"
           find dumper -iname "Il2CppDumper*" -type f
 
       - name: Extract APK + Dump
         run: |
+          set -e
           rm -rf work && mkdir -p work
           cd work && unzip -o ../ff.bin > /dev/null && cd ..
+
+          # XAPK হলে ভিতরের apk গুলো খুলে ফেলো
           if ! find work -name "libil2cpp.so" | grep -q .; then
             for a in $(find work -name "*.apk"); do
               mkdir -p "$a.d" && unzip -o "$a" -d "$a.d" > /dev/null
             done
           fi
+
           LIB=$(find work -path "*arm64-v8a*" -name "libil2cpp.so" | head -1)
           [ -z "$LIB" ] && LIB=$(find work -name "libil2cpp.so" | head -1)
           META=$(find work -name "global-metadata.dat" | head -1)
-          echo "LIB=$LIB" && echo "META=$META"
-          [ -z "$LIB" ] && { echo "libil2cpp.so নেই"; exit 1; }
-          [ -z "$META" ] && { echo "global-metadata.dat নেই"; exit 1; }
+
+          echo "LIB=$LIB"
+          echo "META=$META"
+          [ -z "$LIB" ] && { echo "libil2cpp.so পাওয়া যায়নি"; exit 1; }
+          [ -z "$META" ] && { echo "global-metadata.dat পাওয়া যায়নি"; exit 1; }
+
           echo "LIB=$LIB" >> "$GITHUB_ENV"
           echo "META=$META" >> "$GITHUB_ENV"
+
           mkdir -p dumpout
           RUN=$(find dumper -name "Il2CppDumper.dll" | head -1)
-          EXE=$(find dumper -iname "Il2CppDumper.exe" | head -1)
           if [ -n "$RUN" ]; then
-            dotnet "$RUN" "$LIB" "$META" dumpout || { [ -n "$EXE" ] && mono "$EXE" "$LIB" "$META" dumpout; }
+            dotnet "$RUN" "$LIB" "$META" dumpout
           else
+            EXE=$(find dumper -iname "Il2CppDumper.exe" | head -1)
             mono "$EXE" "$LIB" "$META" dumpout
           fi
           ls -la dumpout
@@ -117,17 +127,22 @@ jobs:
       - name: Patch with auto offset
         run: |
           cat > patch.py <<'PYEOF'
-          import os, re, glob, shutil, zipfile, subprocess
+          import os, re, sys, glob, shutil, zipfile, subprocess
 
-          WORK = "work"; BT = os.environ["BT"]; LIB = os.environ["LIB"]
-          RAW = os.environ.get("TARGETS", "")
-          KS = os.path.abspath("ks.jks"); PW = "123456"
+          WORK = "work"
+          BT   = os.environ["BT"]
+          LIB  = os.environ["LIB"]
+          RAW  = os.environ.get("TARGETS", "")
+          KS   = os.path.abspath("ks.jks")
+          PW   = "123456"
 
           def sh(c):
               print("$", " ".join(c)); subprocess.run(c, check=True)
 
-          rx = re.compile(r"//\s*RVA:\s*0x([0-9A-Fa-f]+)\s*Offset:\s*0x([0-9A-Fa-f]+)")
-          name2off = {}; pending = None
+          # ---------- dump.cs পার্স: নাম -> file offset ----------
+          rx   = re.compile(r"//\s*RVA:\s*0x([0-9A-Fa-f]+)\s*Offset:\s*0x([0-9A-Fa-f]+)")
+          name2off = {}
+          pending = None
           for line in open("dumpout/dump.cs", encoding="utf-8", errors="ignore"):
               m = rx.search(line)
               if m:
@@ -143,8 +158,9 @@ jobs:
                               name2off[nm] = pending
                   pending = None
 
-          print("dump.cs থেকে ফাংশন:", len(name2off))
+          print("dump.cs থেকে ফাংশন পাওয়া গেছে:", len(name2off))
 
+          # ---------- টার্গেট লিস্ট ----------
           targets = []
           for line in RAW.splitlines():
               line = line.strip()
@@ -156,39 +172,56 @@ jobs:
           report = []
           with open(LIB, "r+b") as f:
               for key, data in targets:
-                  pos = int(key, 16) if key.lower().startswith("0x") else name2off.get(key)
+                  if key.lower().startswith("0x"):
+                      pos = int(key, 16)
+                  else:
+                      pos = name2off.get(key)
                   if pos is None:
-                      report.append("MISS  " + key); continue
+                      report.append(f"MISS  {key}  (dump.cs এ নেই)")
+                      continue
                   f.seek(pos); old = f.read(len(data)); f.seek(pos); f.write(data)
-                  report.append("OK    %s  @0x%X  %s -> %s" % (key, pos, old.hex(), data.hex()))
+                  report.append(f"OK    {key}  @0x{pos:X}  {old.hex()} -> {data.hex()}")
+                  print(report[-1])
 
+          # ---------- কীওয়ার্ড ক্যান্ডিডেট লিস্ট (সাহায্য) ----------
           KW = ["Recoil","Ammo","Speed","Damage","Headshot","Spread","Reload",
                 "Health","Aim","Visible","Alive","Firing","Crouch","Parachut",
-                "Run","Walk","Jump","Fire","Weapon","Hit","Head"]
-          cand = sorted("0x%X\t%s" % (o, n) for n, o in name2off.items()
-                        if any(k.lower() in n.lower() for k in KW))
+                "Run","Walk","Jump","Fire","Weapon","Hit"]
+          cand = []
+          for nm, off in name2off.items():
+              if any(k.lower() in nm.lower() for k in KW):
+                  cand.append(f"0x{off:X}\t{nm}")
+          cand.sort()
 
           with open("report.txt", "w") as f:
-              f.write("=== PATCH REPORT ===\n" + "\n".join(report) + "\n\n")
-              f.write("=== CANDIDATE METHODS ===\n" + "\n".join(cand[:400]) + "\n")
-          print("\n=== REPORT ===\n" + "\n".join(report))
+              f.write("=== PATCH REPORT ===\n")
+              f.write("\n".join(report) + "\n\n")
+              f.write("=== CANDIDATE METHODS (নাম দেখে চিট বানাও) ===\n")
+              f.write("\n".join(cand[:400]) + "\n")
 
-          def zipdir(folder, out):
+          print("\n=== REPORT ===")
+          print("\n".join(report))
+
+          # ---------- repack ----------
+          def zipdir(folder, out, prune_d=True):
               if os.path.exists(out): os.remove(out)
               with zipfile.ZipFile(out, "w") as z:
                   for root, dirs, files in os.walk(folder):
-                      rr = os.path.relpath(root, folder)
-                      dirs[:] = [d for d in dirs if not d.endswith(".d")
-                                 and not (rr == "." and d == "META-INF")]
+                      relroot = os.path.relpath(root, folder)
+                      dirs[:] = [d for d in dirs
+                                 if not (prune_d and d.endswith(".d"))
+                                 and not (relroot == "." and d == "META-INF")]
                       for fn in files:
                           rel = os.path.relpath(os.path.join(root, fn), folder)
                           if any(p.endswith(".d") for p in rel.split(os.sep)[:-1]): continue
-                          ct = zipfile.ZIP_STORED if (fn.endswith(".so") or fn == "resources.arsc") else zipfile.ZIP_DEFLATED
-                          z.write(os.path.join(root, fn), rel, compress_type=ct)
+                          full = os.path.join(root, fn)
+                          ct = zipfile.ZIP_STORED if (fn.endswith(".so") or fn == "resources.arsc") \
+                               else zipfile.ZIP_DEFLATED
+                          z.write(full, rel, compress_type=ct)
 
           def align(a, b): sh([os.path.join(BT, "zipalign"), "-p", "-f", "4", a, b])
-          def sign(a, b): sh([os.path.join(BT, "apksigner"), "sign", "--ks", KS,
-                              "--ks-pass", "pass:"+PW, "--key-pass", "pass:"+PW, "--out", b, a])
+          def sign(a, b):  sh([os.path.join(BT, "apksigner"), "sign", "--ks", KS,
+                               "--ks-pass", "pass:"+PW, "--key-pass", "pass:"+PW, "--out", b, a])
 
           inner = sorted(glob.glob(os.path.join(WORK, "*.apk.d")))
           if inner:
